@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "AI Token Tracker",
+  "version": "1.0",
+  "description": "Tracks usage of Gemini Advanced and Claude Pro",
+  "permissions": [
+    "storage"
+  ],
+  "host_permissions": [
+    "https://claude.ai/*",
+    "https://gemini.google.com/*",
+    "https://firestore.googleapis.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://claude.ai/*",
+        "https://gemini.google.com/*"
+      ],
+      "js": ["content.js"]
+    }
+  ]
+}
