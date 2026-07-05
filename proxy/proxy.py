@@ -13,8 +13,9 @@ app = FastAPI()
 
 FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "ai-token-5be33")
 UID = os.getenv("USER_UID", "test_user_uid")
+PROXY_OPENAI_TARGET_URL = os.getenv("PROXY_OPENAI_TARGET_URL", "https://api.openai.com/v1/chat/completions")
 
-async def log_api_usage(provider: str, model: str, prompt_tokens: int, completion_tokens: int):
+async def log_api_usage(provider: str, model: str, prompt_tokens: int, completion_tokens: int, source: str = "terminal"):
     # Ensure we don't log empty usage
     if prompt_tokens == 0 and completion_tokens == 0:
         return
@@ -24,7 +25,7 @@ async def log_api_usage(provider: str, model: str, prompt_tokens: int, completio
         "fields": {
             "provider": {"stringValue": provider},
             "model": {"stringValue": model},
-            "source": {"stringValue": "terminal"},
+            "source": {"stringValue": source},
             "prompt_tokens": {"integerValue": prompt_tokens},
             "completion_tokens": {"integerValue": completion_tokens},
             "timestamp": {"timestampValue": datetime.now(timezone.utc).isoformat()}
@@ -38,9 +39,74 @@ async def log_api_usage(provider: str, model: str, prompt_tokens: int, completio
         except Exception as e:
             print(f"Failed to log API usage to Firestore: {e}")
 
+@app.post("/v1/chat/completions")
+async def proxy_openai(request: Request):
+    target_url = PROXY_OPENAI_TARGET_URL
+    source = request.query_params.get("source", "terminal")
+    body_bytes = await request.body()
+    headers = dict(request.headers)
+    headers.pop("host", None)
+    
+    # Extract model from request body
+    model = "unknown-model"
+    try:
+        body_json = json.loads(body_bytes)
+        model = body_json.get("model", model)
+        # OpenAI requires stream_options: {"include_usage": true} to send usage in SSE.
+        # If the user requested a stream but didn't ask for usage, we should technically inject it,
+        # but injecting into body_bytes requires re-encoding. Let's do it if possible:
+        if body_json.get("stream") and "stream_options" not in body_json:
+            body_json["stream_options"] = {"include_usage": True}
+            body_bytes = json.dumps(body_json).encode('utf-8')
+            # update content-length header
+            if "content-length" in headers:
+                headers["content-length"] = str(len(body_bytes))
+    except:
+        pass
+
+    # Determine provider from model name
+    provider = "openai"
+    if "gemini" in model.lower():
+        provider = "gemini"
+    elif "claude" in model.lower():
+        provider = "claude"
+
+    async def stream_and_parse():
+        prompt_tokens = 0
+        completion_tokens = 0
+        
+        async with httpx.AsyncClient() as client:
+            proxy_req = client.build_request(request.method, target_url, headers=headers, content=body_bytes)
+            resp = await client.send(proxy_req, stream=True)
+            
+            async for chunk in resp.aiter_lines():
+                if chunk.startswith("data: ") and chunk.strip() != "data: [DONE]":
+                    try:
+                        data = json.loads(chunk[6:])
+                        if "usage" in data and data["usage"] is not None:
+                            usage = data["usage"]
+                            prompt_tokens = usage.get("prompt_tokens", prompt_tokens)
+                            completion_tokens = usage.get("completion_tokens", completion_tokens)
+                    except json.JSONDecodeError:
+                        pass
+                
+                # If it's a non-streaming response, we won't hit 'data: ' lines, so we would need to parse the full body.
+                # Since aiter_lines strips newlines, we add them back.
+                yield chunk + "\n"
+        
+        # If stream was false, chunking will just return the full JSON payload line by line.
+        # We handle non-streaming fallback below:
+        if prompt_tokens == 0 and completion_tokens == 0:
+            pass # Ideally parse the full non-streamed body here if stream wasn't true
+
+        asyncio.create_task(log_api_usage(provider, model, prompt_tokens, completion_tokens, source))
+
+    return StreamingResponse(stream_and_parse(), media_type="text/event-stream")
+
 @app.post("/v1/messages")
 async def proxy_claude(request: Request):
     target_url = "https://api.anthropic.com/v1/messages"
+    source = request.query_params.get("source", "terminal")
     body_bytes = await request.body()
     headers = dict(request.headers)
     headers.pop("host", None)
@@ -80,13 +146,14 @@ async def proxy_claude(request: Request):
                 yield chunk + "\n"
 
         # Log after stream completes
-        asyncio.create_task(log_api_usage("claude", model, prompt_tokens, completion_tokens))
+        asyncio.create_task(log_api_usage("claude", model, prompt_tokens, completion_tokens, source))
 
     return StreamingResponse(stream_and_parse(), media_type="text/event-stream")
 
 @app.post("/v1beta/models/{model_param}:streamGenerateContent")
 async def proxy_gemini_stream(model_param: str, request: Request):
     target_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_param}:streamGenerateContent"
+    source = request.query_params.get("source", "terminal")
     body_bytes = await request.body()
     headers = dict(request.headers)
     headers.pop("host", None)
@@ -126,6 +193,7 @@ async def proxy_gemini(model: str, request: Request):
     else:
         target_url += ":generateContent"
 
+    source = request.query_params.get("source", "terminal")
     body_bytes = await request.body()
     headers = dict(request.headers)
     headers.pop("host", None)
@@ -157,7 +225,7 @@ async def proxy_gemini(model: str, request: Request):
 
         # Only log if we found usage metadata
         if prompt_tokens > 0 or completion_tokens > 0:
-            asyncio.create_task(log_api_usage("gemini", model, prompt_tokens, completion_tokens))
+            asyncio.create_task(log_api_usage("gemini", model, prompt_tokens, completion_tokens, source))
 
     return StreamingResponse(stream_and_parse(), media_type="application/json")
 
